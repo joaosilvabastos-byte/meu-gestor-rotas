@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">RouteFlex Pro</string>
+    <string name="title_activity_main">RouteFlex Pro</string>
+    <string name="package_name">com.bybastos.routeflexpro</string>
+    <string name="custom_url_scheme">com.bybastos.routeflexpro</string>
+</resources>
