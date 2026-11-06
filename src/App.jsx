@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, onSnapshot, addDoc, updateDoc, deleteDoc, getDocs, writeBatch } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, getDocs, writeBatch } from 'firebase/firestore';
 import {
-  Trash2, Flag, Fuel, CheckCircle2, Circle, Home, List, Pencil
+  Trash2, Flag, Fuel, CheckCircle2, Circle, Home, List, Pencil, Upload, Download, Check
 } from 'lucide-react';
 import logoBastos from './assets/logoBastos.png';
 import logoSemFundo from './assets/logoSemFundo.png'; // by BASTOS, fundo transparente
@@ -111,22 +111,66 @@ const GEO_OK = 'ok2';
 const MAPS_MAX_POINTS = 10;
 
 // ---------- Google Play Billing (cordova-plugin-purchase v13) ----------
-const PRODUCT_MONTHLY = 'routeflex_pro_monthly';
-const PRODUCT_YEARLY = 'routeflex_pro_yearly';
+// UMA subscrição na Play Console com dois planos base. O produto é o ID da subscrição;
+// cada botão pede a oferta (getOffer) do plano base correspondente.
+const PRODUCT_ID = 'com.bybastos.routeflexpro';
+const PLANS = {
+  monthly: { id: 'monthly-plan', period: 'P1M' },
+  yearly: { id: 'yearly-plan', period: 'P1Y' }
+};
+// Oferta do plano base: 1) id exato do plano; 2) "plano@oferta" (promoção desse plano); 3) pela duração (P1M / P1Y)
+const findPlanOffer = (product, plan) => {
+  const offers = (product && product.offers) || [];
+  const lastPhase = (o) => (o.pricingPhases && o.pricingPhases[o.pricingPhases.length - 1]) || {};
+  return (
+    offers.find((o) => o.id === plan.id) ||
+    offers.find((o) => String(o.id).split('@')[0] === plan.id) ||
+    offers.find((o) => lastPhase(o).billingPeriod === plan.period) ||
+    null
+  );
+};
 const PRO_STORAGE_KEY = 'isPro_playstore';
 const readProFlag = () => { try { return localStorage.getItem(PRO_STORAGE_KEY) === 'true'; } catch { return false; } };
-const writeProFlag = (on) => { try { if (on) localStorage.setItem(PRO_STORAGE_KEY, 'true'); else localStorage.removeItem(PRO_STORAGE_KEY); } catch { /* sem storage */ } };
+// ---------- Armazenamento durável ----------
+// localStorage (síncrono) + espelho em @capacitor/preferences (SharedPreferences do Android), se o plugin existir.
+// Se o Android limpar o localStorage do WebView, os dados voltam do espelho no arranque.
+const nativePrefs = () => { try { return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Preferences; } catch { return null; } };
+const kvSet = (k, v) => {
+  try { localStorage.setItem(k, v); } catch { /* sem storage */ }
+  try { const p = nativePrefs(); if (p) p.set({ key: k, value: v }); } catch { /* sem plugin */ }
+};
+const kvRemove = (k) => {
+  try { localStorage.removeItem(k); } catch { /* sem storage */ }
+  try { const p = nativePrefs(); if (p) p.remove({ key: k }); } catch { /* sem plugin */ }
+};
+const kvGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const kvGetNative = async (k) => { try { const p = nativePrefs(); if (!p) return null; const r = await p.get({ key: k }); return r && r.value != null ? r.value : null; } catch { return null; } };
+
+// Números escritos pelo utilizador: aceita ponto e vírgula decimais; devolve NaN se não houver número
+const sanitizeDecimal = (raw) => String(raw).replace(/[^0-9.,]/g, '');
+const parseDecimal = (raw) => parseFloat(String(raw).replace(',', '.'));
+
+const PRO_CODE_KEY = 'routeflex_pro_code';   // Pro ativado por código de licença
+const STOPS_KEY = 'routeflex_stops_v1';      // lista de destinos
+const readStops = () => { try { const v = JSON.parse(kvGet(STOPS_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } };
+
+const writeProFlag = (on) => { if (on) kvSet(PRO_STORAGE_KEY, 'true'); else kvRemove(PRO_STORAGE_KEY); };
 
 // O listener é registado já quando o módulo carrega, para nunca perder o evento 'deviceready'.
 // Só no telemóvel (Capacitor/Cordova) é que o evento existe; no browser a promessa resolve a false.
 const deviceReady = new Promise((resolve) => {
   if (typeof document === 'undefined') return resolve(false);
+  const pluginThere = () => !!(window.CdvPurchase && window.CdvPurchase.store);
   document.addEventListener('deviceready', () => resolve(true), { once: true });
-  // Se o evento já passou antes de o módulo carregar, o plugin já está disponível: segue em frente.
-  setTimeout(() => resolve(!!(window.CdvPurchase && window.CdvPurchase.store)), 4000);
+  // Se o evento já passou, ou o plugin demora a injetar-se, espreita até 10 s
+  let tries = 0;
+  const poll = setInterval(() => {
+    if (pluginThere()) { clearInterval(poll); resolve(true); }
+    else if (++tries >= 40) { clearInterval(poll); resolve(false); }
+  }, 250);
 });
 // Identifica a versão em execução (aparece em Custos, no fundo). Se não coincidir com a que recebeste, estás a correr outro ficheiro.
-const BUILD_ID = '2026.10.31-csv';
+const BUILD_ID = '2026.11.05-notif';
 
 // ---------- Leitura de CSV por NOME de coluna (qualquer ordem, vírgula ou ponto e vírgula) ----------
 const CSV_ALIASES = {
@@ -160,8 +204,27 @@ const detectDelimiter = (sampleLines) => {
 
 // Lê os bytes do ficheiro: UTF-8 e, se não for válido (Excel antigo em Windows-1252), Windows-1252.
 const decodeCsvBuffer = (buf) => {
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
-  catch { return new TextDecoder('windows-1252').decode(buf); }
+  const b = new Uint8Array(buf);
+  // UTF-16 (o Excel "Unicode" grava assim): reconhece-se pelo BOM FF FE / FE FF
+  if (b.length > 1 && b[0] === 0xff && b[1] === 0xfe) return new TextDecoder('utf-16le').decode(b);
+  if (b.length > 1 && b[0] === 0xfe && b[1] === 0xff) return new TextDecoder('utf-16be').decode(b);
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(b); }
+  catch { return new TextDecoder('windows-1252').decode(b); }
+};
+
+// Localidade por defeito quando o CSV não a traz. Fica 'Lisboa' enquanto não houver outras paragens;
+// a partir daí usa a localidade mais frequente das paragens já confirmadas (serve noutras cidades/países).
+// Para desligar: DEFAULT_CITY = ''.
+const DEFAULT_CITY = 'Lisboa';
+const dominantPlaceText = (list) => {
+  const count = {};
+  list.forEach((x) => { const c = String(x.place || '').trim(); if (c) count[c] = (count[c] || 0) + 1; });
+  return Object.entries(count).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+};
+const dominantCity = (list) => {
+  const count = {};
+  list.forEach((x) => { const c = String(x.place || '').split(', ')[0].trim(); if (c) count[c] = (count[c] || 0) + 1; });
+  return Object.entries(count).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
 };
 
 // Divide uma linha respeitando aspas ("a,b" fica numa célula) e "" como aspa literal
@@ -405,8 +468,8 @@ const TRANSLATIONS = {
     no_dest_group: 'Não há destinos no grupo "{g}".',
     csv_empty: 'O ficheiro CSV está vazio ou sem dados.',
     client_n: 'Cliente {i}',
-    import_ok: 'Importação concluída! {n} destinos carregados com sucesso.',
-    import_ok_one: 'Importação concluída! {n} destino carregado com sucesso.',
+    import_ok: 'Importação OK! {n} destinos carregados.',
+    import_ok_one: 'Importação OK! {n} destino carregado.',
     import_none: 'Não foram encontrados dados válidos.',
     import_err: 'Ocorreu um erro ao processar o ficheiro CSV.',
     enter_addr: 'Introduza a morada do local.',
@@ -444,7 +507,31 @@ const TRANSLATIONS = {
     buy_ok: "Compra concluída. Pro ativado!",
     buy_error: "Não foi possível concluir a compra. Tenta de novo.",
     sub_terms: "Subscrição com renovação automática. Cancela quando quiseres na Google Play.",
-    processing: "A processar…"
+    processing: "A processar…",
+    export_plugin_missing: "Exportar CSV: instala os plugins @capacitor/filesystem e @capacitor/share e corre 'npx cap sync android'.",
+    geo_approx: "Localização aproximada (centro da localidade): confirma/corrige a morada.",
+    export_ready: "Ficheiro pronto: escolhe onde o guardar ou enviar.",
+    csv_bad: "O ficheiro chegou à app sem dados: só tem o texto «{c}» ({b} bytes). O CSV no telemóvel está vazio ou corrompido. Copia-o outra vez para o telemóvel (Drive, e-mail ou cabo USB), abre-o para confirmar que tem as linhas e importa de novo.",
+    export_name_prompt: "Nome do ficheiro CSV:",
+    export_replace: "Já existe o ficheiro «{f}».\n\nOK = substituir\nCancelar = guardar como novo («{n}»)",
+    template_csv: "Modelo CSV",
+    template_saved: "CSV guardado em Downloads!",
+    template_shared: "Modelo pronto: escolhe onde o guardar.",
+    current_dest: "DESTINO ATUAL",
+    floor_label: "Andar",
+    notes_label: "Notas",
+    complete_next: "Concluir e Ir para o Próximo",
+    complete_last: "Concluir (último destino)",
+    navigate_here: "Navegar",
+    route_finished: "Rota concluída! 🎉",
+    nav_app: "Navegação",
+    reopen_stop: "Reabrir destino",
+    no_floor_notes: "Sem andar nem notas para este destino.",
+    done_btn: "Concluído",
+    ph_city: "Localidade / Cidade",
+    replace_route_confirm: "Substituir rota atual?\nOs {n} destinos existentes serão apagados e substituídos pelos do ficheiro.",
+    replace_route_confirm_one: "Substituir rota atual?\nO destino existente será apagado e substituído pelos do ficheiro.",
+    notif_denied: "Ativa as notificações da app para veres o Andar e as Notas por cima do Maps."
   },
 
   en: {
@@ -554,8 +641,8 @@ const TRANSLATIONS = {
     no_dest_group: 'There are no stops in the group "{g}".',
     csv_empty: 'The CSV file is empty or has no data.',
     client_n: 'Client {i}',
-    import_ok: 'Import complete! {n} stops loaded successfully.',
-    import_ok_one: 'Import complete! {n} stop loaded successfully.',
+    import_ok: 'Import OK! {n} stops loaded.',
+    import_ok_one: 'Import OK! {n} stop loaded.',
     import_none: 'No valid data was found.',
     import_err: 'An error occurred while processing the CSV file.',
     enter_addr: 'Enter the address of the place.',
@@ -590,7 +677,31 @@ const TRANSLATIONS = {
     buy_ok: "Purchase complete. Pro activated!",
     buy_error: "The purchase could not be completed. Please try again.",
     sub_terms: "Auto-renewing subscription. Cancel anytime in Google Play.",
-    processing: "Processing…"
+    processing: "Processing…",
+    export_plugin_missing: "CSV export: install @capacitor/filesystem and @capacitor/share and run 'npx cap sync android'.",
+    geo_approx: "Approximate location (town centre): check/correct the address.",
+    export_ready: "File ready: choose where to save or send it.",
+    csv_bad: "The file reached the app without data: it only contains the text “{c}” ({b} bytes). The CSV on the phone is empty or corrupted. Copy it to the phone again (Drive, e-mail or USB), open it to check the rows, then import again.",
+    export_name_prompt: "CSV file name:",
+    export_replace: "The file “{f}” already exists.\n\nOK = replace it\nCancel = save as new (“{n}”)",
+    template_csv: "CSV template",
+    template_saved: "CSV saved in Downloads!",
+    template_shared: "Template ready: choose where to save it.",
+    current_dest: "CURRENT STOP",
+    floor_label: "Floor",
+    notes_label: "Notes",
+    complete_next: "Complete and Go to Next",
+    complete_last: "Complete (last stop)",
+    navigate_here: "Navigate",
+    route_finished: "Route complete! 🎉",
+    nav_app: "Navigation",
+    reopen_stop: "Reopen stop",
+    no_floor_notes: "No floor or notes for this stop.",
+    done_btn: "Done",
+    ph_city: "Town / City",
+    replace_route_confirm: "Replace current route?\nThe {n} existing stops will be deleted and replaced by the ones in the file.",
+    replace_route_confirm_one: "Replace current route?\nThe existing stop will be deleted and replaced by the ones in the file.",
+    notif_denied: "Turn on the app's notifications to see the Floor and Notes over Maps."
   },
 
   es: {
@@ -700,8 +811,8 @@ const TRANSLATIONS = {
     no_dest_group: 'No hay destinos en el grupo "{g}".',
     csv_empty: 'El archivo CSV está vacío o no tiene datos.',
     client_n: 'Cliente {i}',
-    import_ok: '¡Importación completada! {n} destinos cargados con éxito.',
-    import_ok_one: '¡Importación completada! {n} destino cargado con éxito.',
+    import_ok: '¡Importación OK! {n} destinos cargados.',
+    import_ok_one: '¡Importación OK! {n} destino cargado.',
     import_none: 'No se encontraron datos válidos.',
     import_err: 'Se produjo un error al procesar el archivo CSV.',
     enter_addr: 'Introduce la dirección del lugar.',
@@ -736,7 +847,31 @@ const TRANSLATIONS = {
     buy_ok: "Compra completada. ¡Pro activado!",
     buy_error: "No se pudo completar la compra. Inténtalo de nuevo.",
     sub_terms: "Suscripción con renovación automática. Cancela cuando quieras en Google Play.",
-    processing: "Procesando…"
+    processing: "Procesando…",
+    export_plugin_missing: "Exportar CSV: instala los plugins @capacitor/filesystem y @capacitor/share y ejecuta 'npx cap sync android'.",
+    geo_approx: "Ubicación aproximada (centro de la localidad): revisa/corrige la dirección.",
+    export_ready: "Archivo listo: elige dónde guardarlo o enviarlo.",
+    csv_bad: "El archivo llegó a la app sin datos: solo contiene el texto «{c}» ({b} bytes). El CSV del teléfono está vacío o dañado. Cópialo de nuevo al teléfono (Drive, correo o USB), ábrelo para comprobar las filas e impórtalo otra vez.",
+    export_name_prompt: "Nombre del archivo CSV:",
+    export_replace: "Ya existe el archivo «{f}».\n\nAceptar = reemplazar\nCancelar = guardar como nuevo («{n}»)",
+    template_csv: "Modelo CSV",
+    template_saved: "¡CSV guardado en Descargas!",
+    template_shared: "Modelo listo: elige dónde guardarlo.",
+    current_dest: "DESTINO ACTUAL",
+    floor_label: "Piso",
+    notes_label: "Notas",
+    complete_next: "Completar e Ir al Siguiente",
+    complete_last: "Completar (último destino)",
+    navigate_here: "Navegar",
+    route_finished: "¡Ruta completada! 🎉",
+    nav_app: "Navegación",
+    reopen_stop: "Reabrir destino",
+    no_floor_notes: "Sin piso ni notas para este destino.",
+    done_btn: "Hecho",
+    ph_city: "Localidad / Ciudad",
+    replace_route_confirm: "¿Sustituir la ruta actual?\nLos {n} destinos existentes se borrarán y se sustituirán por los del archivo.",
+    replace_route_confirm_one: "¿Sustituir la ruta actual?\nEl destino existente se borrará y se sustituirá por los del archivo.",
+    notif_denied: "Activa las notificaciones de la app para ver el Piso y las Notas sobre Maps."
   },
 
   fr: {
@@ -846,8 +981,8 @@ const TRANSLATIONS = {
     no_dest_group: 'Aucune destination dans le groupe « {g} ».',
     csv_empty: 'Le fichier CSV est vide ou ne contient aucune donnée.',
     client_n: 'Client {i}',
-    import_ok: 'Importation terminée ! {n} destinations chargées avec succès.',
-    import_ok_one: 'Importation terminée ! {n} destination chargée avec succès.',
+    import_ok: 'Importation OK ! {n} destinations chargées.',
+    import_ok_one: 'Importation OK ! {n} destination chargée.',
     import_none: "Aucune donnée valide n'a été trouvée.",
     import_err: "Une erreur s'est produite lors du traitement du fichier CSV.",
     enter_addr: "Saisissez l'adresse du lieu.",
@@ -882,7 +1017,31 @@ const TRANSLATIONS = {
     buy_ok: "Achat terminé. Pro activé !",
     buy_error: "L'achat n'a pas pu être finalisé. Réessayez.",
     sub_terms: "Abonnement à renouvellement automatique. Résiliez à tout moment dans Google Play.",
-    processing: "Traitement…"
+    processing: "Traitement…",
+    export_plugin_missing: "Export CSV : installez @capacitor/filesystem et @capacitor/share puis lancez 'npx cap sync android'.",
+    geo_approx: "Position approximative (centre de la localité) : vérifiez/corrigez l'adresse.",
+    export_ready: "Fichier prêt : choisissez où l'enregistrer ou l'envoyer.",
+    csv_bad: "Le fichier est arrivé sans données : il ne contient que le texte « {c} » ({b} octets). Le CSV du téléphone est vide ou corrompu. Copiez-le de nouveau sur le téléphone (Drive, e-mail ou USB), ouvrez-le pour vérifier les lignes, puis réimportez.",
+    export_name_prompt: "Nom du fichier CSV :",
+    export_replace: "Le fichier « {f} » existe déjà.\n\nOK = remplacer\nAnnuler = enregistrer comme nouveau (« {n} »)",
+    template_csv: "Modèle CSV",
+    template_saved: "CSV enregistré dans Téléchargements !",
+    template_shared: "Modèle prêt : choisissez où l'enregistrer.",
+    current_dest: "DESTINATION ACTUELLE",
+    floor_label: "Étage",
+    notes_label: "Notes",
+    complete_next: "Terminer et Aller au Suivant",
+    complete_last: "Terminer (dernière destination)",
+    navigate_here: "Naviguer",
+    route_finished: "Itinéraire terminé ! 🎉",
+    nav_app: "Navigation",
+    reopen_stop: "Rouvrir la destination",
+    no_floor_notes: "Pas d'étage ni de notes pour cette destination.",
+    done_btn: "Terminé",
+    ph_city: "Localité / Ville",
+    replace_route_confirm: "Remplacer l'itinéraire actuel ?\nLes {n} destinations existantes seront supprimées et remplacées par celles du fichier.",
+    replace_route_confirm_one: "Remplacer l'itinéraire actuel ?\nLa destination existante sera supprimée et remplacée par celles du fichier.",
+    notif_denied: "Activez les notifications de l'app pour voir l'Étage et les Notes par-dessus Maps."
   }
 };
 
@@ -945,7 +1104,7 @@ export default function App() {
 
   // Estados do Utilizador e Dados
   const [user, setUser] = useState(null);
-  const [stops, setStops] = useState([]);
+  const [stops, setStops] = useState(readStops); // arranca com os destinos guardados no telemóvel
   const [finalDest, setFinalDest] = useState(null);
   const [userPos, setUserPos] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -953,7 +1112,7 @@ export default function App() {
 
   // Formulários e Configurações (Incluindo Andar e Notas)
   // Estados para Controlo do Plano Pro e Código de Licença
-  const [userProfile, setUserProfile] = useState({ plan: 'free' }); 
+  const [userProfile, setUserProfile] = useState(() => ({ plan: kvGet(PRO_CODE_KEY) === 'true' ? 'pro' : 'free' }));
   const [showPaywall, setShowPaywall] = useState(false);
   const [promoCode, setPromoCode] = useState('');
   const [promoError, setPromoError] = useState('');
@@ -961,9 +1120,26 @@ export default function App() {
   const [isProPlay, setIsProPlay] = useState(readProFlag); // Pro comprado/restaurado na Google Play
   const [billingReady, setBillingReady] = useState(false);
   const [billingBusy, setBillingBusy] = useState(false);
+  const billingDiag = useRef('A iniciar…'); // texto técnico mostrado se a compra falhar (ajuda a achar o problema)
   const [storePrices, setStorePrices] = useState({});      // preços reais devolvidos pela Play
   const isPro = userProfile?.plan === 'pro' || isProPlay;
-  const [newStop, setNewStop] = useState({ client: '', address: '', postalCode: '', floor: '', notes: '', group: '' });
+  // Guarda os destinos sempre que mudam (um pequeno atraso junta várias alterações seguidas)
+  useEffect(() => {
+    const id = setTimeout(() => { try { kvSet(STOPS_KEY, JSON.stringify(stops)); } catch { /* quota */ } }, 300);
+    return () => clearTimeout(id);
+  }, [stops]);
+  // Se o localStorage foi limpo pelo Android, recupera Pro e destinos do espelho nativo
+  useEffect(() => {
+    (async () => {
+      if (!nativePrefs()) return;
+      if (!readProFlag() && (await kvGetNative(PRO_STORAGE_KEY)) === 'true') { try { localStorage.setItem(PRO_STORAGE_KEY, 'true'); } catch { /* */ } setIsProPlay(true); }
+      if (kvGet(PRO_CODE_KEY) !== 'true' && (await kvGetNative(PRO_CODE_KEY)) === 'true') { try { localStorage.setItem(PRO_CODE_KEY, 'true'); } catch { /* */ } setUserProfile({ plan: 'pro' }); }
+      if (readStops().length === 0) {
+        try { const v = JSON.parse((await kvGetNative(STOPS_KEY)) || '[]'); if (Array.isArray(v) && v.length) setStops((cur) => (cur.length ? cur : v)); } catch { /* */ }
+      }
+    })();
+  }, []);
+  const [newStop, setNewStop] = useState({ client: '', address: '', postalCode: '', city: '', floor: '', notes: '', group: '' });
   const [editingStopId, setEditingStopId] = useState(null); // id da paragem em edição (null = a criar nova)
   const formRef = useRef(null);
   const [exportGroup, setExportGroup] = useState('Todos'); // grupo escolhido para exportar em CSV
@@ -971,6 +1147,16 @@ export default function App() {
   const [energyType, setEnergyType] = useState('Gasóleo');
   const [fuelPrice, setFuelPrice] = useState(1.68);
   const [carData, setCarData] = useState({ plate: '', consumption: 6.5 });
+  // Texto que o utilizador está a escrever (permite campo vazio sem forçar '0'); null = mostra o valor guardado
+  const [priceDraft, setPriceDraft] = useState(null);
+  const [consDraft, setConsDraft] = useState(null);
+  const [toastMsg, setToastMsg] = useState('');
+  const toastTimer = useRef(null);
+  const showToast = (msg) => {
+    setToastMsg(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMsg(''), 2800);
+  };
   const [geoProgress, setGeoProgress] = useState(null); // { done, total } enquanto localiza moradas
 
   // 5 Pílulas Iniciais com o texto 'Editar ✏️'
@@ -1014,31 +1200,39 @@ export default function App() {
   };
   // ---------- Google Play Billing ----------
   const grantPro = () => { writeProFlag(true); setIsProPlay(true); setShowPaywall(false); };
-  const ownsPro = (store) => store.owned(PRODUCT_MONTHLY) || store.owned(PRODUCT_YEARLY);
+  const ownsPro = (store) => store.owned(PRODUCT_ID);
 
   useEffect(() => {
     let cancelled = false;
     deviceReady.then((isDevice) => {
-      if (cancelled || !isDevice) return;
+      if (cancelled) return;
       const CdvPurchase = window.CdvPurchase;
-      if (!CdvPurchase || !CdvPurchase.store) return; // plugin não instalado: segue sem compras
+      if (!isDevice || !CdvPurchase || !CdvPurchase.store) {
+        billingDiag.current = !isDevice && !CdvPurchase
+          ? 'Plugin cordova-plugin-purchase não encontrado (corre: npm i cordova-plugin-purchase && npx cap sync android; ou estás no browser)'
+          : 'deviceready não disparou / store indisponível';
+        return;
+      }
       if (window.__routeflexBillingInit) { setBillingReady(true); return; } // evita registar duas vezes
       window.__routeflexBillingInit = true;
 
+      let initOk = false; // só passa a true depois de store.initialize terminar sem erros
       const { store, ProductType, Platform } = CdvPurchase;
+      try { store.verbosity = CdvPurchase.LogLevel.DEBUG; } catch { /* opcional */ } // logs no logcat: filtra por 'CordovaPurchase'
       const refreshPrices = () => {
         const prices = {};
-        [PRODUCT_MONTHLY, PRODUCT_YEARLY].forEach((id) => {
-          const p = store.get(id, Platform.GOOGLE_PLAY);
-          const price = p && p.getOffer && p.getOffer() && p.getOffer().pricingPhases && p.getOffer().pricingPhases[0];
-          if (price && price.price) prices[id] = price.price;
+        const product = store.get(PRODUCT_ID, Platform.GOOGLE_PLAY);
+        Object.entries(PLANS).forEach(([key, plan]) => {
+          const offer = findPlanOffer(product, plan);
+          const phases = (offer && offer.pricingPhases) || [];
+          const price = phases[phases.length - 1]; // última fase = preço recorrente (ignora período de teste)
+          if (price && price.price) prices[key] = price.price;
         });
         setStorePrices(prices);
       };
 
       store.register([
-        { id: PRODUCT_MONTHLY, type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY },
-        { id: PRODUCT_YEARLY, type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY }
+        { id: PRODUCT_ID, type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY }
       ]);
 
       store.when()
@@ -1050,15 +1244,21 @@ export default function App() {
         })
         .finished(() => setBillingBusy(false))
         .receiptsReady(() => {
-          // Subscrição ainda ativa na conta Google? Mantém/atualiza o estado Pro (cancelada/expirada → volta a Free)
+          // Só retira o Pro se a loja iniciou sem erros e confirma que NÃO há subscrição ativa
           if (ownsPro(store)) grantPro();
-          else if (readProFlag()) { writeProFlag(false); setIsProPlay(false); }
+          else if (initOk && readProFlag()) { writeProFlag(false); setIsProPlay(false); }
         });
 
-      store.error((err) => { console.warn('Billing:', err && err.message); setBillingBusy(false); });
+      store.error((err) => {
+        console.warn('Billing:', err && err.code, err && err.message);
+        billingDiag.current = `Erro da loja ${err && err.code}: ${err && err.message}`;
+        setBillingBusy(false);
+      });
 
-      store.initialize([Platform.GOOGLE_PLAY]).then(() => {
+      store.initialize([Platform.GOOGLE_PLAY]).then((errors) => {
         if (cancelled) return;
+        if (errors && errors.length) billingDiag.current = 'initialize: ' + errors.map((e) => `${e.code} ${e.message}`).join(' | ');
+        else { billingDiag.current = 'Loja iniciada'; initOk = true; }
         setBillingReady(true);
         refreshPrices();
       });
@@ -1067,16 +1267,22 @@ export default function App() {
   }, []);
 
   // Botões Mensal / Anual
-  const handleSubscribe = async (productId) => {
+  const handleSubscribe = async (planKey) => {
+    const plan = PLANS[planKey];
     const CdvPurchase = window.CdvPurchase;
-    if (!billingReady || !CdvPurchase || !CdvPurchase.store) return alert(t('billing_unavailable'));
-    const product = CdvPurchase.store.get(productId, CdvPurchase.Platform.GOOGLE_PLAY);
-    const offer = product && product.getOffer && product.getOffer();
-    if (!offer) return alert(t('billing_unavailable'));
+    if (!plan || !billingReady || !CdvPurchase || !CdvPurchase.store) return alert(`${t('billing_unavailable')}\n\n[${billingDiag.current}]`);
+    const product = CdvPurchase.store.get(PRODUCT_ID, CdvPurchase.Platform.GOOGLE_PLAY);
+    const offer = findPlanOffer(product, plan); // oferta do plano base escolhido (monthly-plan / yearly-plan)
+    if (!offer || offer.canPurchase === false) {
+      // A Play não devolveu o produto/plano (ID errado, plano inativo, app fora de uma faixa de teste, conta sem licença...)
+      const ids = ((product && product.offers) || []).map((o) => o.id).join(', ') || 'nenhuma';
+      const why = !product ? `produto "${PRODUCT_ID}" não devolvido pela Play` : !offer ? `plano "${plan.id}" não encontrado (ofertas devolvidas: ${ids})` : `oferta "${offer.id}" não comprável (já subscrita?)`;
+      return alert(`${t('billing_unavailable')}\n\n[${why} | ${billingDiag.current}]`);
+    }
     setBillingBusy(true);
     try {
       const err = await offer.order(); // devolve um erro, ou undefined se o ecrã de pagamento abriu bem
-      if (err && err.code !== CdvPurchase.ErrorCode.PAYMENT_CANCELLED) alert(t('buy_error'));
+      if (err && err.code !== CdvPurchase.ErrorCode.PAYMENT_CANCELLED) alert(`${t('buy_error')}\n\n[${err.code}: ${err.message}]`);
       if (err) setBillingBusy(false);
       // Sem erro: o resultado chega ao listener 'approved' (que desbloqueia o Pro e liberta o botão)
     } catch (e) {
@@ -1106,6 +1312,7 @@ export default function App() {
   // Validação do Código de Licença
   const handleApplyCode = () => {
     if (promoCode.trim().toLowerCase() === 'route2026pro') {
+      kvSet(PRO_CODE_KEY, 'true'); // mantém o Pro depois de fechar a app
       setUserProfile({ plan: 'pro' });
       setShowPaywall(false);
       setPromoCode('');
@@ -1135,11 +1342,46 @@ export default function App() {
     });
 
     // BOM (U+FEFF) no início: o Excel só abre os acentos corretamente com ele
-    const blob = new Blob([CSV_BOM + rows.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const suggested = `destinos_${namePart}_${new Date().toISOString().slice(0, 10)}`;
+    saveCsvFile(suggested, CSV_BOM + rows.join('\r\n'));
+  };
+
+  // Android (Capacitor): o <a download> não funciona no WebView. Grava no cache e abre a folha de partilha
+  // (Guardar em Ficheiros/Drive, WhatsApp, e-mail...). No browser/PC mantém o download normal.
+  const saveCsvFile = async (suggested, content) => {
+    // Nome escolhido pelo utilizador (sem extensão; a app acrescenta .csv e tira caracteres proibidos)
+    const typed = window.prompt(t('export_name_prompt'), suggested);
+    if (typed === null) return; // cancelou
+    const base = String(typed).replace(/\.csv$/i, '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim() || suggested;
+    let filename = `${base}.csv`;
+
+    const cap = window.Capacitor;
+    const native = !!(cap && cap.isNativePlatform && cap.isNativePlatform());
+    if (native) {
+      const { Filesystem, Share } = cap.Plugins || {};
+      if (!Filesystem || !Share) { alert(t('export_plugin_missing')); return; }
+      const exists = async (name) => { try { await Filesystem.stat({ path: name, directory: 'CACHE' }); return true; } catch { return false; } };
+      // Nome já usado: substituir (OK) ou guardar como novo "nome (2).csv" (Cancelar)
+      if (await exists(filename)) {
+        let k = 2;
+        while (await exists(`${base} (${k}).csv`)) k++;
+        const fresh = `${base} (${k}).csv`;
+        if (!window.confirm(t('export_replace', { f: filename, n: fresh }))) filename = fresh;
+      }
+      try {
+        const written = await Filesystem.writeFile({ path: filename, data: content, directory: 'CACHE', encoding: 'utf8' });
+        await Share.share({ title: filename, dialogTitle: t('export_ready'), files: [written.uri] });
+      } catch (err) {
+        const msg = String((err && err.message) || err || '');
+        if (!/cancel/i.test(msg)) alert(`${t('buy_error')}\n\n[${msg}]`); // cancelar a partilha não é erro
+      }
+      return;
+    }
+    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `destinos_${namePart}_${new Date().toISOString().slice(0, 10)}.csv`;
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1166,25 +1408,49 @@ export default function App() {
   const handleExportCSV = () => handleExportGroupCSV('Todos');
 
   // Importar CSV em Bloco (100% Seguro e Local)
-  const handleImportCSV = (e) => {
-    if (!isPro) {
-      setShowPaywall(true);
-      e.target.value = '';
-      return;
-    }
-
-    const file = e.target.files[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = async (event) => {
+  // O WebView do Android às vezes entrega só o NOME do ficheiro em vez do conteúdo ("ficheiro fantasma").
+  // Por isso tenta vários métodos de leitura e só aceita o que não for esse falso conteúdo.
+  const isPhantom = (buf, name) => {
+    try {
+      const txt = decodeCsvBuffer(buf).trim();
+      return txt.length > 0 && txt.length <= String(name || '').length + 4 && !/[;,\t\n]/.test(txt) && /\.(csv|txt)\]?$/i.test(txt);
+    } catch { return false; }
+  };
+  const readFileRobust = async (file) => {
+    const methods = [
+      () => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsArrayBuffer(file); }),
+      () => file.arrayBuffer(),
+      () => new Response(file).arrayBuffer(),
+      () => file.slice(0, file.size).arrayBuffer()
+    ];
+    let last = null;
+    for (const m of methods) {
       try {
-        const text = decodeCsvBuffer(event.target.result).replace(/^\uFEFF/, '');
+        const buf = await m();
+        if (buf) last = buf;
+        if (buf && buf.byteLength && !isPhantom(buf, file.name)) return buf;
+      } catch (err) { /* tenta o método seguinte */ }
+    }
+    return last;
+  };
+
+  // Processa o conteúdo (bytes) de um CSV: lê, geocodifica e acrescenta os destinos
+  const importCsvBuffer = async (buffer, fileSize) => {
+    {
+      try {
+        // Normaliza as quebras de linha ANTES de qualquer split: \r\n e \r viram \n
+        const text = decodeCsvBuffer(buffer).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
         // \r\n (Windows), \n (Linux/Android) e \r solto (Mac antigo) — todos viram quebra de linha
-        const lines = text.split(/\r\n|\r|\n/).map(l => l.trim()).filter(l => l.length > 0);
+        // Qualquer quebra de linha: \r\n, \n, \r, e também separadores Unicode (\u2028/\u2029/\u0085) e \v/\f; remove NULs
+        const lines = text.replace(/\u0000/g, '').split(/\r\n|[\r\n\u2028\u2029\u0085\u000b\u000c]/).map(l => l.trim()).filter(l => l.length > 0);
 
         if (lines.length === 0) {
           alert(t('csv_empty'));
+          return;
+        }
+        // Ficheiro "fantasma": o Android entregou só o NOME do ficheiro em vez do conteúdo (partilha/cópia falhada)
+        if (lines.length === 1 && !/[;,\t]/.test(lines[0]) && !/\d{3,}/.test(lines[0]) && /\.(csv|txt)\]?$/i.test(lines[0])) {
+          alert(t('csv_bad', { c: lines[0], b: fileSize }));
           return;
         }
 
@@ -1192,7 +1458,20 @@ export default function App() {
         const delim = detectDelimiter(lines);
         const cols0 = parseCsvLine(lines[0], delim);
         const map = mapCsvColumns(cols0);
+        const dataCount = lines.length - (map.legacy ? 0 : 1);
+        if (dataCount <= 0) {
+          alert(t('csv_empty'));
+          return;
+        }
+        // Já há destinos? Pergunta; ao confirmar, limpa a rota anterior ANTES de carregar o ficheiro novo
+        const hadStops = stops.length > 0;
+        if (hadStops) {
+          if (!window.confirm(t('replace_route_confirm', { n: stops.length }))) return;
+          await clearRoute();
+        }
+        const existing = hadStops ? [] : stops; // os destinos antigos já não contam
         const rows = [];
+        const defaultCity = dominantCity(existing.filter((x) => x.geo === GEO_OK)) || DEFAULT_CITY;
         // Com cabeçalho a 1ª linha é ignorada; sem cabeçalho (map.legacy) é já uma morada
         for (let i = map.legacy ? 0 : 1; i < lines.length; i++) {
           const cols = parseCsvLine(lines[i], delim);
@@ -1209,6 +1488,8 @@ export default function App() {
             notes: get('notes'),
             group: get('group') || 'Todos'
           };
+          // Sem localidade nem código postal e com a morada numa só parte ("Avenida X"): assume a localidade por defeito
+          if (!row.city && !row.postalCode && row.address && !/,/.test(row.address) && defaultCity && plainText(row.address) !== plainText(defaultCity)) row.city = defaultCity;
           if (!row.address && !get('client')) continue;
           rows.push(row);
         }
@@ -1222,8 +1503,8 @@ export default function App() {
           const r = rows[k];
           // Só a morada é pesquisada: o nome do cliente nunca entra na pesquisa
           if (k > 0) await sleep(1100);
-          const refCountry = dominantCountry([...stops.filter((x) => x.geo === GEO_OK), ...newStops.filter((x) => x.geo === GEO_OK)]);
-          const found = r.address ? await geocodeAddress(r.address, r.postalCode, r.city, refCountry) : null;
+          const refCountry = dominantCountry([...existing.filter((x) => x.geo === GEO_OK), ...newStops.filter((x) => x.geo === GEO_OK)]);
+          const found = r.address ? await geocodeAddress(r.address, r.postalCode, r.city, refCountry, r.client) : null;
           if (!found) missing++;
           newStops.push({
             id: `${Date.now()}-${k}`,
@@ -1237,13 +1518,14 @@ export default function App() {
             lat: found ? Number(found.lat) : null,
             lng: found ? Number(found.lon) : null,
             place: found?.place || '',
-            geo: found ? GEO_OK : 'missing', // GEO_OK = localização confirmada pelo Nominatim
+            geo: found ? (found.approx ? 'approx' : GEO_OK) : 'missing', // GEO_OK = confirmada; 'approx' = só o centro da localidade
             selected: !!found
           });
         }
 
         if (newStops.length > 0) {
           setStops(prev => [...prev, ...newStops]);
+          newStops.forEach((st) => { cloudSaveStop(st); }); // em segundo plano; já ficam guardadas no telemóvel
           alert(t('import_ok', { n: newStops.length - missing }) + (missing ? '\n' + t('import_missing', { f: missing }) : ''));
         } else {
           alert(t('import_none'));
@@ -1254,11 +1536,58 @@ export default function App() {
       } finally {
         setGeoProgress(null);
         setLoading(false);
-        e.target.value = '';
       }
-    };
+    }
+  };
 
-    reader.readAsArrayBuffer(file);
+  // <input type="file"> (browser/PC e plano B no Android)
+  const handleImportCSV = async (e) => {
+    const input = e.target;
+    if (!isPro) {
+      setShowPaywall(true);
+      input.value = '';
+      return;
+    }
+    const file = input.files && input.files[0];
+    if (!file) return;
+    let buffer = null;
+    try { buffer = await readFileRobust(file); } catch (err) { console.warn('Leitura do CSV:', err); }
+    input.value = '';
+    if (!buffer) { alert(t('import_err')); return; }
+    await importCsvBuffer(buffer, file.size);
+  };
+
+  // Android (Capacitor): seletor de ficheiros nativo do sistema, que devolve o conteúdo em base64.
+  // Não depende do <input type="file"> do WebView. Plugin: @capawesome/capacitor-file-picker.
+  const getNativePicker = () => {
+    const cap = window.Capacitor;
+    return cap && cap.isNativePlatform && cap.isNativePlatform() && cap.Plugins && cap.Plugins.FilePicker;
+  };
+  const handleImportClick = async () => {
+    if (!isPro) { setShowPaywall(true); return; }
+    const picker = getNativePicker();
+    if (!picker) { document.getElementById('hiddenCsvInput')?.click(); return; }
+    try {
+      const res = await picker.pickFiles({ limit: 1, readData: true });
+      const f = res && res.files && res.files[0];
+      if (!f) return;
+      let buffer = null;
+      if (f.data) {
+        const bin = atob(f.data);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        buffer = bytes.buffer;
+      } else if (f.blob) {
+        buffer = await f.blob.arrayBuffer();
+      }
+      if (!buffer) { alert(t('import_err')); return; }
+      await importCsvBuffer(buffer, f.size || buffer.byteLength);
+    } catch (err) {
+      const msg = String((err && err.message) || err || '');
+      if (/cancel/i.test(msg)) return; // o utilizador fechou o seletor
+      console.warn('FilePicker:', err);
+      document.getElementById('hiddenCsvInput')?.click(); // plano B: seletor normal do WebView
+    }
   };
 
   // Referências do Mapa Leaflet.
@@ -1372,7 +1701,7 @@ export default function App() {
     if (!L || !layer) return;
 
     layer.clearLayers();
-    orderByProximity(stops.filter((s) => s.selected && hasCoords(s)), userPos)
+    orderByProximity(stops.filter((s) => s.selected && !s.done && hasCoords(s)), userPos)
       .forEach((s, idx) => {
         const numberedIcon = L.divIcon({
           className: 'custom-number-marker',
@@ -1467,7 +1796,11 @@ export default function App() {
       const q = collection(db, 'artifacts', appId, 'users', user.uid, 'stops');
       unsubs.push(onSnapshot(q, (snapshot) => {
         const stopsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        setStops(stopsData);
+        // Junta a nuvem com os destinos que ainda só existem no telemóvel (importados offline, por exemplo)
+        setStops((prev) => {
+          const ids = new Set(stopsData.map((x) => String(x.id)));
+          return [...stopsData, ...prev.filter((x) => !ids.has(String(x.id)))];
+        });
       }));
 
       const settingsDoc = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'main');
@@ -1489,7 +1822,7 @@ export default function App() {
 
   // 4. Distância/duração da rota para o dashboard: estimativa imediata (offline) + valor exato do OSRM
   useEffect(() => {
-    const sel = orderByProximity(stops.filter((s) => s.selected && hasCoords(s)), userPos);
+    const sel = orderByProximity(stops.filter((s) => s.selected && !s.done && hasCoords(s)), userPos);
     if (sel.length === 0) {
       setRouteInfo(null);
       return;
@@ -1618,7 +1951,7 @@ export default function App() {
     list.forEach((x) => { const c = countryOf(x.place); if (c) count[c] = (count[c] || 0) + 1; });
     return Object.entries(count).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
   };
-  const geocodeAddress = async (base, postalInput = '', city = '', refCountry = '') => {
+  const geocodeAddress = async (base, postalInput = '', city = '', refCountry = '', clientName = '') => {
     const attempts = []; // { q, guarded }
     const add = (q, guarded = false) => attempts.push({ q, guarded });
     if (city) {
@@ -1628,6 +1961,13 @@ export default function App() {
       if (postalInput) add(`${postalInput}, ${city}`);
       // Rede de segurança: o OSM nem sempre conhece a freguesia/bairro (ex.: Camarate). Tenta sem localidade.
       add(base, true);
+      // Número de porta que o OSM não conhece: aceita a rua inteira
+      const noNumber = base.replace(/[\s,]+\d+\s?[A-Za-z]?$/, '').trim();
+      if (noNumber && noNumber !== base) add(`${noNumber}, ${city}`);
+      // Local de interesse sem número (miradouro, restaurante...): tenta o nome do cliente + localidade.
+      // Só se a morada não tem números e o nome não parece uma pessoa/animal ("Rex (Beagle)", "Cliente 3").
+      const cn = String(clientName || '').trim();
+      if (cn && !/\d/.test(base) && !/[()]/.test(cn) && !/\d/.test(cn) && plainText(cn) !== plainText(base)) add(`${cn}, ${city}`, true);
     } else {
       if (postalInput && !base.includes(postalInput)) add(`${base}, ${postalInput}`);
       add(base);
@@ -1644,10 +1984,29 @@ export default function App() {
       if (guarded && refCountry && result.place && countryOf(result.place) !== refCountry) continue;
       return result;
     }
+    // Último recurso (sem morada reconhecida): centro da localidade, marcado como aproximado
+    if (city) {
+      await sleep(1100);
+      const centre = await geocode(city);
+      if (centre) return { ...centre, approx: true };
+    }
     return null;
   };
 
-  const emptyStopForm = () => ({ client: '', address: '', postalCode: '', floor: '', notes: '', group: normalizeGroup(selectedGroup) });
+  // Grava (ou atualiza) UMA paragem inteira na nuvem com o mesmo id do ecrã; falha em silêncio (modo local)
+  const cloudSaveStop = async (stop) => {
+    try {
+      const cu = await ensureUser();
+      if (cu && cu.uid !== 'local-demo-user') {
+        const clean = JSON.parse(JSON.stringify(stop)); // o Firestore não aceita undefined
+        await setDoc(doc(db, 'artifacts', appId, 'users', cu.uid, 'stops', String(stop.id)), clean);
+      }
+    } catch (err) {
+      console.warn('Modo local: destino guardado só no telemóvel.', err);
+    }
+  };
+
+  const emptyStopForm = () => ({ client: '', address: '', postalCode: '', city: '', floor: '', notes: '', group: normalizeGroup(selectedGroup) });
 
   // Preenche o formulário de topo com os dados de uma paragem (modo edição)
   const startEditStop = (s) => {
@@ -1655,6 +2014,7 @@ export default function App() {
       client: s.client || '',
       address: s.address || '',
       postalCode: s.postalCode || '',
+      city: s.city || '',
       floor: s.floor || '',
       notes: s.notes || '',
       group: normalizeGroup(s.group)
@@ -1675,6 +2035,7 @@ export default function App() {
     const clientInput = (newStop.client || '').trim();
     const addressInput = (newStop.address || '').trim();
     const postalInput = (newStop.postalCode || '').trim();
+    const cityInput = (newStop.city || '').trim();
 
     // Base da pesquisa: SÓ a morada. O nome/entidade é apenas para mostrar na lista.
     const base = addressInput;
@@ -1693,13 +2054,15 @@ export default function App() {
 
       // Em edição, só volta a geocodificar se a morada ou o código postal mudaram
       const locationChanged =
-        !editingStop || editingStop.geo !== GEO_OK || base !== editingStop.address || postalInput !== (editingStop.postalCode || '');
+        !editingStop || editingStop.geo !== GEO_OK || base !== editingStop.address || postalInput !== (editingStop.postalCode || '') || cityInput !== (editingStop.city || '');
 
       let lat;
       let lng;
       let place = editingStop?.place || '';
+      let geoState = editingStop ? editingStop.geo : GEO_OK;
       if (locationChanged) {
-        const result = await geocodeAddress(base, postalInput);
+        // A localidade escrita entra na pesquisa (filtra candidatos de outras cidades/países)
+        const result = await geocodeAddress(base, postalInput, cityInput, dominantCountry(stops.filter((x) => x.geo === GEO_OK)), clientInput);
 
         if (!result) {
           alert(t('not_found'));
@@ -1708,6 +2071,7 @@ export default function App() {
         lat = Number(result.lat);
         lng = Number(result.lon);
         place = result.place || '';
+        geoState = result.approx ? 'approx' : GEO_OK;
       } else {
         lat = editingStop.lat;
         lng = editingStop.lng;
@@ -1723,8 +2087,8 @@ export default function App() {
         lat,
         lng,
         place,
-        city: editingStop && !locationChanged ? editingStop.city || '' : '', // a localidade do CSV só vale para a morada original
-        geo: GEO_OK
+        city: cityInput,
+        geo: geoState
       };
 
       // ---- Guardar alterações de uma paragem existente ----
@@ -1734,17 +2098,7 @@ export default function App() {
         setNewStop(emptyStopForm());
         setIsAddFormOpen(false); // fecha o painel depois de guardar
 
-        try {
-          const currentUser = await userPromise;
-          if (currentUser && currentUser.uid !== 'local-demo-user') {
-            await updateDoc(
-              doc(db, 'artifacts', appId, 'users', currentUser.uid, 'stops', String(editingStop.id)),
-              fields
-            );
-          }
-        } catch (err) {
-          console.warn("Modo local: alterações guardadas só na memória.", err);
-        }
+        await cloudSaveStop({ ...editingStop, ...fields });
         return;
       }
 
@@ -1764,17 +2118,7 @@ export default function App() {
       setIsAddFormOpen(false);
 
       // 2. Tenta guardar na Nuvem/Firebase em segundo plano (se falhar, não lança alert)
-      try {
-        const currentUser = await userPromise;
-        if (currentUser && currentUser.uid !== 'local-demo-user') {
-          await addDoc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'stops'), {
-            ...newStopData,
-            id: undefined // deixa o Firestore gerar a sua própria chave na nuvem
-          });
-        }
-      } catch (err) {
-        console.warn("Modo local: destino guardado na memória/browser.", err);
-      }
+      await cloudSaveStop(newStopData);
 
     } catch (e) {
       console.error('Erro ao processar destino:', e);
@@ -1826,15 +2170,7 @@ export default function App() {
     );
 
     // 2. Tenta guardar no Firebase em segundo plano
-    try {
-      const currentUser = await ensureUser();
-      if (currentUser && currentUser.uid !== 'local-demo-user') {
-        const stopRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'stops', stop.id);
-        await updateDoc(stopRef, { selected: !stop.selected });
-      }
-    } catch (e) {
-      console.warn("Modo local: não foi possível sincronizar seleção na nuvem", e);
-    }
+    await cloudSaveStop({ ...stop, selected: !stop.selected });
   };
 
   // Remover Paragem (Com Fallback Local)
@@ -1867,18 +2203,13 @@ export default function App() {
         setGeoProgress({ done: k, total: targets.length });
         const st = targets[k];
         if (k > 0) await sleep(1100);
-        const found = await geocodeAddress(st.address, st.postalCode || '', st.city || '', dominantCountry(stops.filter((x) => x.geo === GEO_OK)));
+        const found = await geocodeAddress(st.address, st.postalCode || '', st.city || '', dominantCountry(stops.filter((x) => x.geo === GEO_OK)), st.client || '');
         const patch = found
-          ? { lat: Number(found.lat), lng: Number(found.lon), place: found.place || '', geo: GEO_OK, selected: st.selected || st.geo === 'missing' }
+          ? { lat: Number(found.lat), lng: Number(found.lon), place: found.place || '', geo: found.approx ? 'approx' : GEO_OK, selected: st.selected || st.geo === 'missing' }
           : { lat: null, lng: null, geo: 'missing', selected: false };
         if (found) ok++;
         setStops((prev) => prev.map((x) => (x.id === st.id ? { ...x, ...patch } : x)));
-        try {
-          const cu = await ensureUser();
-          if (cu && cu.uid !== 'local-demo-user') {
-            await updateDoc(doc(db, 'artifacts', appId, 'users', cu.uid, 'stops', String(st.id)), patch);
-          }
-        } catch (err) { /* modo local */ }
+        await cloudSaveStop({ ...st, ...patch });
       }
       alert(t('fix_done', { ok, f: targets.length - ok }));
     } finally {
@@ -1888,8 +2219,8 @@ export default function App() {
   };
 
   // Recomeçar do zero: apaga destinos, destino final, rota desenhada e os dados na nuvem
-  const handleClearAll = async () => {
-    if (!window.confirm(t('clear_confirm'))) return;
+  // Apaga destinos, destino final, rota desenhada e dados na nuvem (sem perguntar)
+  const clearRoute = async () => {
     setStops([]);
     setFinalDest(null);
     setFinalDestInput('');
@@ -1904,11 +2235,16 @@ export default function App() {
     } catch (e) {
       console.warn('Modo local: não foi possível limpar a nuvem', e);
     }
+    setStops([]); // garante vazio mesmo que um evento antigo da nuvem tenha chegado entretanto
+  };
+  const handleClearAll = async () => {
+    if (!window.confirm(t('clear_confirm'))) return;
+    await clearRoute();
   };
 
   // Cálculo da Rota OSRM (desenha a linha no mapa; os marcadores são geridos pelos efeitos 2b/2c)
   const calculateRoute = async () => {
-    const selectedStops = orderByProximity(stops.filter((s) => s.selected && hasCoords(s)), userPos);
+    const selectedStops = orderByProximity(stops.filter((s) => s.selected && !s.done && hasCoords(s)), userPos);
     if (selectedStops.length === 0) return alert(t('sel_one'));
 
     setActiveTab('mapa');
@@ -1937,7 +2273,8 @@ export default function App() {
     }
   };
 
-  const selectedCount = stops.filter(s => s.selected).length;
+  const showNum = (n) => String(n).replace('.', lang === 'en' ? '.' : ','); // 1.68 -> '1,68' (PT/ES/FR)
+  const selectedCount = stops.filter(s => s.selected && !s.done).length;
 
 
   const filteredStops = selectedGroup === 'Todos' ? stops : stops.filter((s) => normalizeGroup(s.group) === selectedGroup);
@@ -1950,41 +2287,55 @@ export default function App() {
   // Sequência da rota (FONTE ÚNICA): paragens selecionadas, da posição atual para a mais próxima e assim
   // sucessivamente. A lista de destinos (números 1, 2, 3…) e o link do Maps usam exactamente esta ordem.
   // O destino final (se existir) continua a ser sempre o `destination`, depois da última paragem.
-  const routeSequence = orderByProximity(
-    filteredStops.filter((s) => s.selected && (s.address || hasCoords(s))),
-    userPos
+  const doneList = filteredStops
+    .filter((s) => s.selected && s.done)
+    .sort((a, b) => (a.doneAt || 0) - (b.doneAt || 0));
+  const lastDone = doneList[doneList.length - 1];
+  // Os pendentes ordenam-se a partir do último destino concluído (onde o utilizador está); sem concluídos, do GPS
+  const pendingSequence = orderByProximity(
+    filteredStops.filter((s) => s.selected && !s.done && (s.address || hasCoords(s))),
+    hasCoords(lastDone) ? lastDone : userPos
   );
+  const routeSequence = [...doneList, ...pendingSequence];
+  const currentStop = pendingSequence[0] || null;
+  const nextStop = pendingSequence[1] || null;
   const routeNumber = {}; // id -> 1, 2, 3…
   routeSequence.forEach((s, i) => { routeNumber[s.id] = i + 1; });
   // Lista mostrada: primeiro as paragens da rota pela ordem de entrega, depois as não selecionadas
   const displayStops = [...routeSequence, ...filteredStops.filter((s) => !routeNumber[s.id])];
+
+  // Como cada ponto vai para o Google Maps (funciona em qualquer país):
+  //  1) morada + código postal + localidade/país devolvidos pelo geocodificador (sem inventar cidade)
+  //  2) sem localidade guardada: coordenadas exatas (sem ambiguidade)
+  //  3) sem coordenadas: só o texto da morada
+  const formatAddress = (item) => {
+    if (!item) return '';
+    if (typeof item === 'string') return encodeURIComponent(item);
+    const address = (item.address || '').trim();
+    const city = (item.city || '').trim();
+    if (address && city) {
+      // Com localidade: morada + código postal + localidade (+ país, se vier do geocodificador) — nunca só a rua
+      const seen = plainText(`${address} ${item.postalCode || ''}`);
+      const extra = [];
+      [city, ...(item.place || '').split(', ')].filter(Boolean).forEach((part) => {
+        if (!seen.includes(plainText(part)) && !extra.some((e) => plainText(e) === plainText(part))) extra.push(part);
+      });
+      return encodeURIComponent([address, item.postalCode, ...extra].filter(Boolean).join(', '));
+    }
+    // Sem localidade: coordenadas. O geocodificador já procurou junto da posição GPS do dispositivo,
+    // por isso o Maps não vai parar a outro país. Último recurso (sem coordenadas): texto + localidade/país mais comuns da rota.
+    if (hasCoords(item)) return `${item.lat},${item.lng}`;
+    if (!address) return '';
+    const ctx = dominantPlaceText(stops.filter((x) => x.geo === GEO_OK));
+    return encodeURIComponent([address, item.postalCode, ctx].filter(Boolean).join(', '));
+  };
+
 
   // Devolve UM link por cada grupo de até 10 pontos. O 2.º link começa (origin) onde o 1.º acaba, para nada
   // ficar esquecido. O destino final (se existir) é sempre o último ponto do último link.
   const buildGoogleMapsUrls = (sel) => {
     const points = [...sel, ...(hasFinalDest ? [finalDest] : [])];
     if (points.length === 0) return [];
-
-    // Como cada ponto vai para o Google Maps (funciona em qualquer país):
-    //  1) morada + código postal + localidade/país devolvidos pelo geocodificador (sem inventar cidade)
-    //  2) sem localidade guardada: coordenadas exatas (sem ambiguidade)
-    //  3) sem coordenadas: só o texto da morada
-    const formatAddress = (item) => {
-      if (!item) return '';
-      if (typeof item === 'string') return encodeURIComponent(item);
-      const precise = /\d/.test(item.address || '') || !!item.postalCode; // rua com número ou código postal
-      if (precise && item.address && (item.city || item.place)) {
-        // acrescenta só o que ainda não está escrito (evita "Lisboa, Lisboa")
-        const seen = plainText(`${item.address} ${item.postalCode || ''}`);
-        const extra = [];
-        [item.city, ...(item.place || '').split(', ')].filter(Boolean).forEach((part) => {
-          if (!seen.includes(plainText(part)) && !extra.some((e) => plainText(e) === plainText(part))) extra.push(part);
-        });
-        return encodeURIComponent([item.address, item.postalCode, ...extra].filter(Boolean).join(', '));
-      }
-      if (hasCoords(item)) return `${item.lat},${item.lng}`;
-      return item.address ? encodeURIComponent([item.address, item.postalCode].filter(Boolean).join(', ')) : '';
-    };
 
     const urls = [];
     for (let i = 0; i < points.length; i += MAPS_MAX_POINTS) {
@@ -1999,15 +2350,181 @@ export default function App() {
     }
     return urls;
   };
-  const googleMapsUrls = buildGoogleMapsUrls(routeSequence);
+  const googleMapsUrls = buildGoogleMapsUrls(pendingSequence); // só o que falta fazer
 
   // Botões "Iniciar Percurso" (1 por link) + aviso quando a rota é dividida
   const mapsButtons = (cls) => googleMapsUrls.map((url, i) => (
-    <a key={i} href={url} target="_blank" rel="noopener noreferrer" className={cls}>
+    <a key={i} href={url} target="_blank" rel="noopener noreferrer" className={cls} onClick={() => notifyStop(pendingSequence[i * MAPS_MAX_POINTS])}>
       <span>{t('launch_gmaps')}{googleMapsUrls.length > 1 ? ` (${i + 1}/${googleMapsUrls.length})` : ''}</span>
     </a>
   ));
   const splitNote = googleMapsUrls.length > 1 ? t('maps_split', { n: googleMapsUrls.length, max: MAPS_MAX_POINTS }) : null;
+
+  // Abre o Google Maps com navegação direta para UM destino
+  const openNavigation = (stop) => {
+    if (!stop) return;
+    const dest = formatAddress(stop);
+    if (!dest) return;
+    window.open(`https://www.google.com/maps/dir/?api=1&destination=${dest}&travelmode=driving`, '_blank', 'noopener');
+  };
+
+  // ---------- Notificação do Android com o Nome / Andar / Notas do destino ----------
+  // Plugin: @capacitor/local-notifications. Usa sempre o mesmo id, por isso cada novo destino SUBSTITUI o anterior
+  // e fica no centro de notificações (deslizar de cima) enquanto o utilizador está no Google Maps.
+  const NOTIF_ID = 1001;
+  const NOTIF_CHANNEL = 'route_stops';
+  const notifPlugin = () => {
+    const cap = window.Capacitor;
+    return cap && cap.isNativePlatform && cap.isNativePlatform() && cap.Plugins && cap.Plugins.LocalNotifications;
+  };
+  const notifReady = async (ln) => {
+    let perm = await ln.checkPermissions();
+    if (perm.display !== 'granted') perm = await ln.requestPermissions();
+    if (perm.display !== 'granted') return false;
+    try {
+      await ln.createChannel({ id: NOTIF_CHANNEL, name: t('current_dest'), importance: 4, visibility: 1, vibration: true });
+    } catch (err) { /* canal já existe */ }
+    return true;
+  };
+  const notifyStop = async (stop) => {
+    const ln = notifPlugin();
+    if (!ln || !stop) return;
+    try {
+      if (!(await notifReady(ln))) { showToast(t('notif_denied')); return; }
+      const lines = [
+        stop.floor ? `${t('floor_label')}: ${stop.floor}` : '',
+        stop.notes ? `${t('notes_label')}: ${stop.notes}` : ''
+      ].filter(Boolean);
+      await ln.schedule({
+        notifications: [{
+          id: NOTIF_ID,
+          title: stop.client || stop.address,
+          body: lines.join(' · ') || t('no_floor_notes'),
+          largeBody: lines.join('\n') || t('no_floor_notes'), // aberta, mostra Andar e Notas em linhas separadas
+          summaryText: t('current_dest'),
+          channelId: NOTIF_CHANNEL,
+          autoCancel: false // não desaparece ao tocar; é substituída pelo destino seguinte
+        }]
+      });
+    } catch (err) {
+      console.warn('Notificação:', err);
+    }
+  };
+  // Pede a permissão de notificações logo que há um destino (uma só vez), para não interromper o Maps mais tarde
+  const hasCurrentStop = !!currentStop;
+  useEffect(() => {
+    if (!hasCurrentStop || kvGet('routeflex_notif_asked')) return;
+    const ln = notifPlugin();
+    if (!ln) return;
+    kvSet('routeflex_notif_asked', '1');
+    (async () => {
+      try { const perm = await ln.checkPermissions(); if (perm.display !== 'granted') await ln.requestPermissions(); } catch (err) { /* ignora */ }
+    })();
+  }, [hasCurrentStop]);
+  const clearStopNotification = async () => {
+    const ln = notifPlugin();
+    if (!ln) return;
+    try { await ln.cancel({ notifications: [{ id: NOTIF_ID }] }); } catch (err) { /* ignora */ }
+  };
+
+  // "Concluído": marca o destino atual, o cartão passa logo ao seguinte e abre o Google Maps para a morada dele
+  const completeAndNext = () => {
+    if (!currentStop) return;
+    const finished = { ...currentStop, done: true, doneAt: Date.now() };
+    setStops((prev) => prev.map((x) => (x.id === finished.id ? finished : x)));
+    cloudSaveStop(finished);
+    if (nextStop) {
+      notifyStop(nextStop); // sem esperar: o Maps abre logo a seguir, a notificação fica no centro de notificações
+      openNavigation(nextStop);
+    } else {
+      clearStopNotification();
+      showToast(t('route_finished'));
+    }
+  };
+  const reopenStop = (stop) => {
+    const reopened = { ...stop, done: false, doneAt: null };
+    setStops((prev) => prev.map((x) => (x.id === stop.id ? reopened : x)));
+    cloudSaveStop(reopened);
+  };
+
+  // Ficheiro modelo para preencher e importar. Android: tenta gravar mesmo em Download; se o Android não deixar,
+  // abre a folha de partilha ("Guardar em Ficheiros"). Browser: download normal.
+  const handleTemplateCSV = async () => {
+    const content = [
+      'Cliente,Morada,Codigo Postal,Localidade,Andar,Notas,Grupo',
+      'Exemplo Cliente,Rua Exemplo 123,1000-001,Lisboa,1 Dto,Nota exemplo,Grupo A'
+    ].join('\r\n') + '\r\n';
+    const filename = 'modelo_routeflex.csv';
+    const cap = window.Capacitor;
+    if (cap && cap.isNativePlatform && cap.isNativePlatform()) {
+      const { Filesystem, Share } = cap.Plugins || {};
+      if (!Filesystem) { alert(t('export_plugin_missing')); return; }
+      try {
+        try { if (Filesystem.requestPermissions) await Filesystem.requestPermissions(); } catch { /* Android 11+ não pede */ }
+        await Filesystem.writeFile({ path: `Download/${filename}`, data: content, directory: 'EXTERNAL_STORAGE', encoding: 'utf8', recursive: true });
+        showToast(t('template_saved'));
+        return;
+      } catch (err) {
+        console.warn('Gravar em Download falhou, a partilhar:', err);
+      }
+      try {
+        if (!Share) { alert(t('export_plugin_missing')); return; }
+        const written = await Filesystem.writeFile({ path: filename, data: content, directory: 'CACHE', encoding: 'utf8' });
+        showToast(t('template_shared'));
+        await Share.share({ title: filename, dialogTitle: t('template_shared'), files: [written.uri] });
+      } catch (err) {
+        const msg = String((err && err.message) || err || '');
+        if (!/cancel/i.test(msg)) alert(`${t('buy_error')}\n\n[${msg}]`);
+      }
+      return;
+    }
+    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = filename;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast(t('template_saved'));
+  };
+
+  // Cartão "Destino Atual": Andar e Notas em destaque + botão para concluir e seguir
+  const currentCard = currentStop ? (
+    <div className="rounded-2xl border-2 border-amber-400 bg-amber-50 p-3 shadow-md space-y-2">
+      <div className="flex items-center justify-between text-[10px] font-extrabold tracking-wide text-amber-700">
+        <span>{t('current_dest')}</span>
+        <span>{doneList.length + 1}/{routeSequence.length}</span>
+      </div>
+      <div className="text-lg font-extrabold text-slate-800 leading-tight break-words">{currentStop.client}</div>
+      <div className="text-xs text-slate-600 break-words">
+        {[currentStop.address, currentStop.postalCode, currentStop.city].filter(Boolean).join(', ')}
+      </div>
+      {(currentStop.floor || currentStop.notes) ? (
+        <div className="space-y-1.5">
+          {currentStop.floor && (
+            <div className="bg-white rounded-xl border border-amber-300 px-3 py-2">
+              <div className="text-[10px] font-bold uppercase text-slate-500">{t('floor_label')}</div>
+              <div className="text-2xl font-black text-[#004a99] leading-tight break-words">{currentStop.floor}</div>
+            </div>
+          )}
+          {currentStop.notes && (
+            <div className="bg-white rounded-xl border border-amber-300 px-3 py-2">
+              <div className="text-[10px] font-bold uppercase text-slate-500">{t('notes_label')}</div>
+              <div className="text-base font-bold text-slate-800 leading-snug break-words">{currentStop.notes}</div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="text-[11px] text-slate-400 italic">{t('no_floor_notes')}</div>
+      )}
+      <button
+        type="button"
+        onClick={completeAndNext}
+        className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-sm shadow-md flex items-center justify-center gap-2 cursor-pointer"
+      >
+        <Check className="w-4 h-4" />{t('done_btn')}
+      </button>
+    </div>
+  ) : null;
 
   // Custo da rota = distância x consumo x preço. Recalcula sozinho quando muda qualquer um dos três.
   const unitLabel = energyType === 'Elétrico' ? 'kWh' : 'L';
@@ -2112,18 +2629,12 @@ export default function App() {
 
               {/* Ferramentas Úteis (Sem redundâncias de menus) */}
               <div className="bg-white rounded-xl p-3 border border-slate-200 shadow-sm space-y-2">
-{/* <span className="text-xs font-bold text-slate-700 block">Ferramentas Rápidas</span> */}                <div className="grid grid-cols-1 gap-2">
+{/* <span className="text-xs font-bold text-slate-700 block">Ferramentas Rápidas</span> */}                <div className="flex flex-row gap-2">
                   <button 
-                    onClick={() => {
-                      if (!isPro) {
-                        setShowPaywall(true);
-                      } else {
-                        document.getElementById('hiddenCsvInput')?.click();
-                      }
-                    }}
-                    className="p-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg flex items-center justify-center gap-2 text-slate-700 transition-colors cursor-pointer"
+                    onClick={handleImportClick}
+                    className="flex-1 basis-0 min-w-0 p-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg flex items-center justify-center gap-2 text-slate-700 transition-colors cursor-pointer"
                   >
-                    <span className="text-base">📄</span>
+                    <Upload className="w-4 h-4 shrink-0" />
                     <span className="text-xs font-bold">{t('import_csv')} {!isPro && '🔒'}</span>
                     <input
                       id="hiddenCsvInput"
@@ -2132,6 +2643,14 @@ export default function App() {
                       onChange={handleImportCSV}
                       className="hidden"
                     />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleTemplateCSV}
+                    className="flex-1 basis-0 min-w-0 p-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg flex items-center justify-center gap-2 text-slate-700 transition-colors cursor-pointer"
+                  >
+                    <Download className="w-4 h-4 shrink-0" />
+                    <span className="text-xs font-bold">{t('template_csv')}</span>
                   </button>
                 </div>
               </div>
@@ -2143,6 +2662,7 @@ export default function App() {
              ========================================== */}
         {activeTab === 'listas' && (
             <div className="space-y-3">
+              {currentCard}
               
               {/* Barra de Grupos Dinâmica com Scroll Horizontal */}
               <div className="space-y-1.5">
@@ -2287,7 +2807,7 @@ export default function App() {
         className="w-full border border-slate-200 p-1.5 rounded outline-none focus:border-[#004a99]"
       />
 
-      {/* Janela de Código Postal e Janela de Andar / Fração */}
+      {/* Código Postal e Localidade / Cidade */}
       <div className="grid grid-cols-2 gap-2">
         <input 
           type="text" 
@@ -2298,13 +2818,22 @@ export default function App() {
         />
         <input 
           type="text" 
-          placeholder={t('ph_floor')} 
-          value={newStop.floor || ''}
-          onChange={e => setNewStop({ ...newStop, floor: e.target.value })}
-          autoComplete="off"
+          placeholder={t('ph_city')} 
+          value={newStop.city || ''}
+          onChange={e => setNewStop({ ...newStop, city: e.target.value })}
           className="col-span-1 border border-slate-200 p-1.5 rounded outline-none focus:border-[#004a99]"
         />
       </div>
+
+      {/* Andar / Fração */}
+      <input 
+        type="text" 
+        placeholder={t('ph_floor')} 
+        value={newStop.floor || ''}
+        onChange={e => setNewStop({ ...newStop, floor: e.target.value })}
+        autoComplete="off"
+        className="w-full border border-slate-200 p-1.5 rounded outline-none focus:border-[#004a99]"
+      />
 
       {/* Janela de Notas */}
       <input 
@@ -2409,7 +2938,17 @@ export default function App() {
                             {s.selected ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <Circle className="w-4 h-4 text-slate-300" />}
                           </button>
                           
-                          {routeNumber[s.id] && (
+                          {s.done && (
+                            <button
+                              type="button"
+                              onClick={() => reopenStop(s)}
+                              title={t('reopen_stop')}
+                              className="shrink-0 w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center mr-1 cursor-pointer"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                          )}
+                          {!s.done && routeNumber[s.id] && (
                             <span
                               title={t('route_order')}
                               className="shrink-0 w-5 h-5 rounded-full bg-[#2563eb] text-white text-[10px] font-bold flex items-center justify-center mr-1"
@@ -2419,7 +2958,7 @@ export default function App() {
                           )}
 
                           <div className="flex-1 truncate mx-1">
-                            <b className="text-[#1e293b]">{s.client}</b><br/>
+                            <b className={s.done ? 'text-slate-400 line-through' : 'text-[#1e293b]'}>{s.client}</b><br/>
                             <span className="text-[#64748b] text-[10px] truncate">{s.address}</span>
                           </div>
 
@@ -2427,7 +2966,10 @@ export default function App() {
                             {normalizeGroup(s.group) || t('general')}
                           </span>
 
-                          {s.geo !== GEO_OK && (
+                          {s.geo === 'approx' && (
+                            <span title={t('geo_approx')} className="ml-1 text-[11px]">📍</span>
+                          )}
+                          {s.geo !== GEO_OK && s.geo !== 'approx' && (
                             <span title={t('geo_unverified')} className="ml-1 text-[11px]">⚠️</span>
                           )}
 
@@ -2564,10 +3106,12 @@ export default function App() {
                       {energyType === 'Elétrico' ? t('price_kwh') : t('price_l')}
                     </span>
                     <input 
-                      type="number" 
-                      step="0.01" 
-                      value={fuelPrice} 
-                      onChange={e => setFuelPrice(parseFloat(e.target.value) || 0)}
+                      type="text" 
+                      inputMode="decimal"
+                      value={priceDraft ?? showNum(fuelPrice)}
+                      onFocus={e => { setPriceDraft(Number(fuelPrice) === 0 ? '' : showNum(fuelPrice)); e.target.select(); }}
+                      onChange={e => { const raw = sanitizeDecimal(e.target.value); setPriceDraft(raw); const n = parseDecimal(raw); setFuelPrice(Number.isFinite(n) ? n : 0); }}
+                      onBlur={() => setPriceDraft(null)}
                       className="w-20 border border-slate-300 rounded p-1 text-right font-bold text-[#004a99] outline-none focus:border-[#004a99]"
                     />
                   </div>
@@ -2577,10 +3121,12 @@ export default function App() {
                       {energyType === 'Elétrico' ? t('cons_kwh') : t('cons_l')}
                     </span>
                     <input 
-                      type="number" 
-                      step="0.1" 
-                      value={carData.consumption}
-                      onChange={e => setCarData({ ...carData, consumption: parseFloat(e.target.value) || 0 })}
+                      type="text" 
+                      inputMode="decimal"
+                      value={consDraft ?? showNum(carData.consumption)}
+                      onFocus={e => { setConsDraft(Number(carData.consumption) === 0 ? '' : showNum(carData.consumption)); e.target.select(); }}
+                      onChange={e => { const raw = sanitizeDecimal(e.target.value); setConsDraft(raw); const n = parseDecimal(raw); setCarData({ ...carData, consumption: Number.isFinite(n) ? n : 0 }); }}
+                      onBlur={() => setConsDraft(null)}
                       className="w-20 border border-slate-300 rounded p-1 text-right font-bold text-[#004a99] outline-none focus:border-[#004a99]"
                     />
                   </div>
@@ -2681,23 +3227,23 @@ export default function App() {
             {/* Opções de Preço */}
             <div className="space-y-2 mb-2">
               <button 
-                onClick={() => handleSubscribe(PRODUCT_MONTHLY)}
+                onClick={() => handleSubscribe('monthly')}
                 disabled={billingBusy}
                 className="w-full disabled:opacity-60 py-2.5 px-3 rounded-xl border-2 border-[#004a99] bg-blue-50/50 hover:bg-blue-50 flex items-center justify-between font-bold text-slate-800 transition cursor-pointer"
               >
                 <span className="text-xs">{t('plan_monthly')}</span>
-                <span className="text-xs text-[#004a99]">{storePrices[PRODUCT_MONTHLY] || t('price_month')} <span className="text-[9px] font-normal text-slate-500">{t('per_month')}</span></span>
+                <span className="text-xs text-[#004a99]">{storePrices.monthly || t('price_month')} <span className="text-[9px] font-normal text-slate-500">{t('per_month')}</span></span>
               </button>
 
               <button 
-                onClick={() => handleSubscribe(PRODUCT_YEARLY)}
+                onClick={() => handleSubscribe('yearly')}
                 disabled={billingBusy}
                 className="w-full disabled:opacity-60 py-2.5 px-3 rounded-xl bg-gradient-to-r from-[#004a99] to-blue-700 text-white flex items-center justify-between font-bold shadow-md hover:opacity-95 transition relative overflow-hidden cursor-pointer"
               >
                 <span className="text-xs flex items-center gap-1">
                   {t('plan_yearly')} <span className="bg-amber-400 text-slate-900 text-[8px] px-1.5 py-0.5 rounded-full font-extrabold uppercase">{t('save_badge')}</span>
                 </span>
-                <span className="text-xs">{storePrices[PRODUCT_YEARLY] || t('price_year')} <span className="text-[9px] font-normal text-blue-200">{t('per_year')}</span></span>
+                <span className="text-xs">{storePrices.yearly || t('price_year')} <span className="text-[9px] font-normal text-blue-200">{t('per_year')}</span></span>
               </button>
             </div>
 
@@ -2754,6 +3300,12 @@ export default function App() {
             </div>
 
           </div>
+        </div>
+      )}
+
+      {toastMsg && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-[60] max-w-[90%] bg-slate-900/90 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg text-center">
+          {toastMsg}
         </div>
       )}
 

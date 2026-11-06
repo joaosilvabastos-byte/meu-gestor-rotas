@@ -160,6 +160,7 @@
   <androidx.wear.tiles/>
   <androidx.wear.watchface/>
   <androidx.wear.watchfacepush/>
+  <androidx.web/>
   <androidx.webgpu/>
   <androidx.webkit/>
   <androidx.window/>
